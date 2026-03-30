@@ -58,6 +58,8 @@ target_sources(
                 ${PROJECT_SOURCE_DIR}/include/beman/net/detail/get_scope_token.hpp
                 ${PROJECT_SOURCE_DIR}/include/beman/net/detail/remote_endpoint.hpp
                 ${PROJECT_SOURCE_DIR}/include/beman/net/detail/uring_context.hpp
+                ${PROJECT_SOURCE_DIR}/include/beman/net/detail/iocp_context.hpp
+                ${PROJECT_SOURCE_DIR}/include/beman/net/detail/platform.hpp
                 ${PROJECT_SOURCE_DIR}/include/beman/net/detail/initiate.hpp
 )
 
@@ -83,5 +85,13 @@ if(LINUX AND BEMAN_NET_WITH_URING)
     target_compile_definitions(
         ${PROJECT_NAME}_headers
         INTERFACE BEMAN_NET_USE_URING
+    )
+endif()
+
+if(WIN32)
+    target_link_libraries(${PROJECT_NAME}_headers INTERFACE ws2_32 mswsock)
+    target_compile_definitions(
+        ${PROJECT_NAME}_headers
+        INTERFACE BEMAN_NET_USE_IOCP
     )
 endif()

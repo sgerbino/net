@@ -4,9 +4,9 @@
 #ifndef INCLUDED_BEMAN_NET_DETAIL_ENDPOINT
 #define INCLUDED_BEMAN_NET_DETAIL_ENDPOINT
 
+#include <beman/net/detail/platform.hpp>
 #include <algorithm>
 #include <cstring>
-#include <sys/socket.h>
 
 // ----------------------------------------------------------------------------
 

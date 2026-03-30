@@ -14,16 +14,22 @@
 #include <stop_token>
 #include <system_error>
 #include <vector>
+#include <beman/net/detail/platform.hpp>
+#ifndef _WIN32
 #include <fcntl.h>
-#include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 namespace ex  = ::beman::execution;
 namespace net = ::beman::net;
 
 namespace {
 
-constexpr int         iterations = 30000;
+#ifdef _WIN32
+constexpr int           iterations = 5000;
+#else
+constexpr int           iterations = 30000;
+#endif
 constexpr ::std::size_t chunk    = 5;
 constexpr ::std::size_t total    = iterations * chunk;
 
@@ -61,56 +67,120 @@ struct env_wrapper {
     auto await_resume() { return aw.await_resume(); }
 };
 
-// ---- socketpair setup -----------------------------------------------------
-
-struct fd_pair {
-    int fd[2]{};
-    fd_pair() { [[maybe_unused]] int rc = ::socketpair(AF_UNIX, SOCK_STREAM, 0, fd); assert(rc == 0); }
-};
+// ---- cross-platform connected socket pair ---------------------------------
 
 struct socket_pair {
-    fd_pair                                 fds;
+    ::beman::net::detail::native_handle_type raw[2]{
+        ::beman::net::detail::invalid_handle,
+        ::beman::net::detail::invalid_handle
+    };
     net::io_context                         context;
     ::beman::net::detail::context_base*     ctx;
     net::ip::tcp::socket                    writer;
     net::ip::tcp::socket                    reader;
 
     socket_pair() : ctx(context.get_scheduler().get_context()),
-                    writer(ctx, ctx->make_socket(fds.fd[0])),
-                    reader(ctx, ctx->make_socket(fds.fd[1])) {}
+                    writer(ctx, ctx->make_socket(make_pair_fds()[0])),
+                    reader(ctx, ctx->make_socket(make_pair_fds()[1])) {}
+
+    auto make_pair_fds() -> ::beman::net::detail::native_handle_type* {
+        if (raw[0] != ::beman::net::detail::invalid_handle)
+            return raw;
+#ifdef _WIN32
+        WSADATA wsa;
+        ::WSAStartup(MAKEWORD(2, 2), &wsa);
+
+        SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(listener != INVALID_SOCKET);
+
+        ::sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        addr.sin_port        = 0;
+        assert(::bind(listener, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr)) == 0);
+        assert(::listen(listener, 1) == 0);
+
+        ::sockaddr_in bound{};
+        int len = sizeof(bound);
+        assert(::getsockname(listener, reinterpret_cast<::sockaddr*>(&bound), &len) == 0);
+
+        SOCKET client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(client != INVALID_SOCKET);
+        assert(::connect(client, reinterpret_cast<::sockaddr*>(&bound), sizeof(bound)) == 0);
+
+        SOCKET accepted = ::accept(listener, nullptr, nullptr);
+        assert(accepted != INVALID_SOCKET);
+        ::closesocket(listener);
+
+        // Increase buffer sizes so fill() can buffer all test data
+        int bufsize = 256 * 1024;
+        ::setsockopt(client, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
+        ::setsockopt(accepted, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bufsize), sizeof(bufsize));
+
+        raw[0] = static_cast<::beman::net::detail::native_handle_type>(client);
+        raw[1] = static_cast<::beman::net::detail::native_handle_type>(accepted);
+#else
+        int fds[2];
+        assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+        raw[0] = fds[0];
+        raw[1] = fds[1];
+#endif
+        return raw;
+    }
 
     void fill(::std::size_t bytes) {
         ::std::vector<char> data(bytes, 'x');
+        auto handle = ctx->native_handle(writer.id());
         ::std::size_t written = 0;
         while (written < bytes) {
-            auto n = ::write(fds.fd[0], data.data() + written, bytes - written);
+#ifdef _WIN32
+            int n = ::send(static_cast<SOCKET>(handle), data.data() + written,
+                           static_cast<int>(bytes - written), 0);
+#else
+            auto n = ::write(static_cast<int>(handle), data.data() + written, bytes - written);
+#endif
             assert(n > 0);
             written += static_cast<::std::size_t>(n);
         }
     }
 };
 
-// ---- benchmark A: raw recvmsg ---------------------------------------------
+// ---- benchmark A: raw recv ------------------------------------------------
 
 auto bench_raw(socket_pair& sp) -> double {
     sp.fill(total);
 
-    char    buf[chunk];
+    char buf[chunk];
+    auto handle = sp.ctx->native_handle(sp.reader.id());
+
+#ifdef _WIN32
+    u_long nonblocking = 1;
+    ::ioctlsocket(static_cast<SOCKET>(handle), FIONBIO, &nonblocking);
+
+    auto t0 = ::std::chrono::high_resolution_clock::now();
+    for (int i = 0; i < iterations; ++i) {
+        int n;
+        do { n = ::recv(static_cast<SOCKET>(handle), buf, static_cast<int>(chunk), 0); }
+        while (n < 0 && ::WSAGetLastError() == WSAEINTR);
+        assert(n == static_cast<int>(chunk));
+    }
+    auto t1 = ::std::chrono::high_resolution_clock::now();
+#else
+    ::fcntl(static_cast<int>(handle), F_SETFL, O_NONBLOCK);
+
     ::msghdr msg{};
     ::iovec  iov{buf, chunk};
     msg.msg_iov    = &iov;
     msg.msg_iovlen = 1;
-    int fd = sp.ctx->native_handle(sp.reader.id());
-
-    ::fcntl(fd, F_SETFL, O_NONBLOCK);
 
     auto t0 = ::std::chrono::high_resolution_clock::now();
     for (int i = 0; i < iterations; ++i) {
         ::ssize_t n;
-        do { n = ::recvmsg(fd, &msg, 0); } while (n < 0 && errno == EINTR);
+        do { n = ::recvmsg(static_cast<int>(handle), &msg, 0); } while (n < 0 && errno == EINTR);
         assert(n == static_cast<::ssize_t>(chunk));
     }
     auto t1 = ::std::chrono::high_resolution_clock::now();
+#endif
 
     return ::std::chrono::duration<double, ::std::nano>(t1 - t0).count() / iterations;
 }
@@ -252,7 +322,7 @@ auto main() -> int {
 
     ::std::cout << ::std::fixed << ::std::setprecision(1);
     ::std::cout << "receive benchmark (" << iterations << " iterations, " << chunk << " bytes each)\n\n";
-    ::std::cout << "  raw recvmsg:            " << ::std::setw(8) << raw   << " ns/read\n";
+    ::std::cout << "  raw recv:               " << ::std::setw(8) << raw   << " ns/read\n";
     ::std::cout << "  eager awaitable:        " << ::std::setw(8) << eager << " ns/read  (+" << eager - raw << ")\n";
     ::std::cout << "  bare awaitable:         " << ::std::setw(8) << aw    << " ns/read  (+" << aw - raw << ")\n";
     ::std::cout << "  IoAwaitable (no stop):  " << ::std::setw(8) << io_ns << " ns/read  (+" << io_ns - raw << ")\n";

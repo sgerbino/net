@@ -13,7 +13,7 @@
 #include <memory_resource>
 #include <stop_token>
 #include <system_error>
-#include <sys/socket.h>
+#include <beman/net/detail/platform.hpp>
 
 // ----------------------------------------------------------------------------
 
@@ -37,15 +37,59 @@ struct io_env {
 struct receive_awaitable;
 struct receive_io_awaitable;
 struct receive_eager_awaitable;
+
+// Cross-platform speculative recv helper.
+// Returns positive byte count on success, 0 for connection reset,
+// -1 for EWOULDBLOCK/EAGAIN, or sets ec and returns -2 for other errors.
+inline auto try_recv(::beman::net::detail::native_handle_type handle,
+                     ::msghdr& msg, ::std::error_code& ec) noexcept -> int {
+#ifdef _WIN32
+    if (msg.msg_iov && msg.msg_iovlen > 0) {
+        WSABUF wsabuf;
+        wsabuf.buf = static_cast<CHAR*>(msg.msg_iov[0].iov_base);
+        wsabuf.len = static_cast<ULONG>(msg.msg_iov[0].iov_len);
+        DWORD bytes{};
+        DWORD flags{};
+        int rc = ::WSARecv(static_cast<SOCKET>(handle), &wsabuf, 1,
+                           &bytes, &flags, NULL, NULL);
+        if (rc == 0) {
+            return static_cast<int>(bytes);
+        }
+        int err = ::WSAGetLastError();
+        if (err == WSAEWOULDBLOCK)
+            return -1;
+        if (err == WSAECONNRESET)
+            return 0;
+        ec = ::std::error_code(err, ::std::system_category());
+        return -2;
+    }
+    return -1;
+#else
+    for (;;) {
+        auto n = ::recvmsg(static_cast<int>(handle), &msg, 0);
+        if (n >= 0)
+            return static_cast<int>(n);
+        if (errno == EINTR)
+            continue;
+        if (errno == ECONNRESET || errno == EPIPE)
+            return 0;
+        if (errno == EWOULDBLOCK || errno == EAGAIN)
+            return -1;
+        ec = ::std::error_code(errno, ::std::system_category());
+        return -2;
+    }
+#endif
+}
+
 } // namespace beman::net::detail
 
 // ----------------------------------------------------------------------------
 
 /** A coroutine awaitable for socket receive that bypasses sender machinery.
 
-    Tries recvmsg speculatively in await_suspend. If data is available,
+    Tries recv speculatively in await_suspend. If data is available,
     completes inline via symmetric transfer with no atomics, no virtual
-    dispatch, and no stop callback. Falls back to poll registration on
+    dispatch, and no stop callback. Falls back to context registration on
     EWOULDBLOCK.
 */
 struct beman::net::detail::receive_awaitable {
@@ -101,24 +145,15 @@ struct beman::net::detail::receive_awaitable {
     auto await_suspend(::std::coroutine_handle<> h) noexcept -> ::std::coroutine_handle<> {
         auto fd = d_context->native_handle(d_id);
 
-        ::ssize_t n;
-        do {
-            n = ::recvmsg(fd, &d_msg, 0);
-        } while (n < 0 && errno == EINTR);
-
+        int n = ::beman::net::detail::try_recv(fd, d_msg, d_error);
         if (n >= 0) {
             d_result = static_cast<::std::size_t>(n);
             return h;
         }
-        if (errno == ECONNRESET || errno == EPIPE) {
-            d_result = 0;
+        if (n == -2) // error already in d_error
             return h;
-        }
-        if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            d_error = ::std::error_code(errno, ::std::system_category());
-            return h;
-        }
 
+        // EWOULDBLOCK — register with context
         d_op.d_handle = h;
         d_op.d_bytes  = &d_result;
         d_op.d_ec     = &d_error;
@@ -144,7 +179,7 @@ struct beman::net::detail::receive_awaitable {
 
 /** IoAwaitable receive with full environment propagation (capy pattern).
 
-    Same speculative recvmsg as receive_awaitable, but accepts io_env
+    Same speculative recv as receive_awaitable, but accepts io_env
     in await_suspend for cancellation, executor affinity, and allocator
     propagation. On the inline path, the only added cost over the bare
     awaitable is a single stop_requested() atomic load.
@@ -179,7 +214,7 @@ struct beman::net::detail::receive_io_awaitable {
                        ::beman::net::detail::io_env const* env) noexcept
         -> ::std::coroutine_handle<> {
 
-        // Cancellation check — 1 atomic load on the inline path
+        // Cancellation check -- 1 atomic load on the inline path
         if (env->stop_token.stop_requested()) {
             d_result = 0;
             return h;
@@ -187,25 +222,15 @@ struct beman::net::detail::receive_io_awaitable {
 
         auto fd = d_context->native_handle(d_id);
 
-        ::ssize_t n;
-        do {
-            n = ::recvmsg(fd, &d_msg, 0);
-        } while (n < 0 && errno == EINTR);
-
+        int n = ::beman::net::detail::try_recv(fd, d_msg, d_error);
         if (n >= 0) {
             d_result = static_cast<::std::size_t>(n);
             return h;
         }
-        if (errno == ECONNRESET || errno == EPIPE) {
-            d_result = 0;
+        if (n == -2)
             return h;
-        }
-        if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            d_error = ::std::error_code(errno, ::std::system_category());
-            return h;
-        }
 
-        // EWOULDBLOCK — stop callback only constructed on the deferred path
+        // EWOULDBLOCK -- stop callback only constructed on the deferred path
         d_op.d_handle = h;
         d_op.d_bytes  = &d_result;
         d_op.d_ec     = &d_error;
@@ -229,10 +254,10 @@ struct beman::net::detail::receive_io_awaitable {
 
 // ----------------------------------------------------------------------------
 
-/** Eager awaitable that tries recvmsg in await_ready.
+/** Eager awaitable that tries recv in await_ready.
 
     When data is available, await_ready returns true and the coroutine
-    never suspends — no coroutine handle manipulation, no symmetric
+    never suspends -- no coroutine handle manipulation, no symmetric
     transfer, no atomic exchange. This is the fastest possible path
     for inline completions, and one the sender bridge cannot achieve
     because start() is called inside await_suspend.
@@ -265,23 +290,13 @@ struct beman::net::detail::receive_eager_awaitable {
     auto await_ready() noexcept -> bool {
         auto fd = d_context->native_handle(d_id);
 
-        ::ssize_t n;
-        do {
-            n = ::recvmsg(fd, &d_msg, 0);
-        } while (n < 0 && errno == EINTR);
-
+        int n = ::beman::net::detail::try_recv(fd, d_msg, d_error);
         if (n >= 0) {
             d_result = static_cast<::std::size_t>(n);
             d_ready  = true;
             return true;
         }
-        if (errno == ECONNRESET || errno == EPIPE) {
-            d_result = 0;
-            d_ready  = true;
-            return true;
-        }
-        if (errno != EWOULDBLOCK && errno != EAGAIN) {
-            d_error = ::std::error_code(errno, ::std::system_category());
+        if (n == -2) {
             d_ready = true;
             return true;
         }

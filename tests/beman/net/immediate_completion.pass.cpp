@@ -8,13 +8,72 @@
 #include <iostream>
 #include <string_view>
 #include <system_error>
-#include <sys/socket.h>
+#include <beman/net/detail/platform.hpp>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 namespace ex  = ::beman::execution;
 namespace net = ::beman::net;
 
 namespace {
+
+// Cross-platform connected socket pair using TCP loopback.
+struct socket_pair {
+    ::beman::net::detail::native_handle_type fds[2]{};
+
+    socket_pair() {
+#ifdef _WIN32
+        WSADATA wsa;
+        ::WSAStartup(MAKEWORD(2, 2), &wsa);
+
+        SOCKET listener = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(listener != INVALID_SOCKET);
+
+        ::sockaddr_in addr{};
+        addr.sin_family      = AF_INET;
+        addr.sin_addr.s_addr = ::htonl(INADDR_LOOPBACK);
+        addr.sin_port        = 0;
+        assert(::bind(listener, reinterpret_cast<::sockaddr*>(&addr), sizeof(addr)) == 0);
+        assert(::listen(listener, 1) == 0);
+
+        ::sockaddr_in bound{};
+        int len = sizeof(bound);
+        assert(::getsockname(listener, reinterpret_cast<::sockaddr*>(&bound), &len) == 0);
+
+        SOCKET client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        assert(client != INVALID_SOCKET);
+        assert(::connect(client, reinterpret_cast<::sockaddr*>(&bound), sizeof(bound)) == 0);
+
+        SOCKET accepted = ::accept(listener, nullptr, nullptr);
+        assert(accepted != INVALID_SOCKET);
+        ::closesocket(listener);
+
+        fds[0] = static_cast<::beman::net::detail::native_handle_type>(client);
+        fds[1] = static_cast<::beman::net::detail::native_handle_type>(accepted);
+#else
+        int raw[2];
+        assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, raw) == 0);
+        fds[0] = raw[0];
+        fds[1] = raw[1];
+#endif
+    }
+
+    auto write_all(const void* data, ::std::size_t len) -> void {
+        const char* p = static_cast<const char*>(data);
+        ::std::size_t written = 0;
+        while (written < len) {
+#ifdef _WIN32
+            int n = ::send(static_cast<SOCKET>(fds[0]), p + written,
+                           static_cast<int>(len - written), 0);
+#else
+            auto n = ::write(fds[0], p + written, len - written);
+#endif
+            assert(n > 0);
+            written += static_cast<::std::size_t>(n);
+        }
+    }
+};
 
 struct size_receiver {
     using receiver_concept = ex::receiver_t;
@@ -44,21 +103,19 @@ auto test_timer_immediate_completion() -> void {
 
 // Write 25 bytes then drain them with 5 receives of 5 bytes each.
 // Data is pre-loaded so each async_receive completes inline during start()
-// via the speculative work() path — no poll() syscall needed.
+// via the speculative work() path -- no poll()/IOCP syscall needed.
 auto test_socket_immediate_receive() -> void {
     ::std::cout << "test socket immediate receive\n";
 
-    int fds[2];
-    assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
-
+    socket_pair sp;
     net::io_context context;
     auto*           ctx = context.get_scheduler().get_context();
 
-    net::ip::tcp::socket writer(ctx, ctx->make_socket(fds[0]));
-    net::ip::tcp::socket reader(ctx, ctx->make_socket(fds[1]));
+    net::ip::tcp::socket writer(ctx, ctx->make_socket(sp.fds[0]));
+    net::ip::tcp::socket reader(ctx, ctx->make_socket(sp.fds[1]));
 
     const char msg[] = "abcdefghijklmnopqrstuvwxy";
-    assert(::write(fds[0], msg, 25) == 25);
+    sp.write_all(msg, 25);
 
     char          buf[25]    = {};
     ::std::size_t total_read = 0;
@@ -71,7 +128,7 @@ auto test_socket_immediate_receive() -> void {
         auto state = ex::connect(::std::move(sndr), size_receiver{&received_size, &completed});
         ex::start(state);
 
-        // Completes inline — no event loop iteration needed
+        // Completes inline -- no event loop iteration needed
         assert(completed);
         assert(received_size == 5);
         total_read += received_size;
