@@ -19,6 +19,7 @@
 #include <beman/execution/execution.hpp>
 
 #include <cstdint>
+#include <iostream>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cerrno>

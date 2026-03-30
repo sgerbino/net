@@ -163,8 +163,13 @@ struct beman::net::detail::poll_context final : ::beman::net::detail::context_ba
     }
 
     auto add_outstanding(::beman::net::detail::io_base* completion) -> ::beman::net::detail::submit_result {
-        auto id{completion->id};
-        if (this->d_sockets[id].blocking ||
+        auto  id{completion->id};
+        auto& rec{this->d_sockets[id]};
+        if (rec.blocking) {
+            if (-1 != ::fcntl(this->native_handle(id), F_SETFL, O_NONBLOCK))
+                rec.blocking = false;
+        }
+        if (rec.blocking ||
             completion->work(*this, completion) == ::beman::net::detail::submit_result::submit) {
             decltype(pollfd().events) events{};
             if (bool(completion->event & ::beman::net::event_type::in)) {
@@ -233,6 +238,7 @@ struct beman::net::detail::poll_context final : ::beman::net::detail::context_ba
             op->error(::std::error_code(errno, ::std::system_category()));
             return ::beman::net::detail::submit_result::error;
         }
+        this->d_sockets[op->id].blocking = false;
         if (0 == ::connect(handle, endpoint.data(), endpoint.size())) {
             op->complete();
             return ::beman::net::detail::submit_result::ready;
@@ -265,7 +271,12 @@ struct beman::net::detail::poll_context final : ::beman::net::detail::context_ba
             }
         };
 
-        return this->add_outstanding(op);
+        // Register directly — speculative work() is wrong for connect
+        // because getsockopt(SO_ERROR) returns 0 before the connect completes
+        this->d_poll.emplace_back(::pollfd{handle, POLLIN | POLLOUT, short()});
+        this->d_outstanding.emplace_back(op);
+        this->wakeup();
+        return ::beman::net::detail::submit_result::submit;
     }
     auto receive(::beman::net::detail::context_base::receive_operation* op)
         -> ::beman::net::detail::submit_result override {

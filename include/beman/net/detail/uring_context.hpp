@@ -8,18 +8,25 @@
 #include <beman/net/detail/context_base.hpp>
 
 #include <cassert>
+#include <cerrno>
 #include <cstdint>
 #include <system_error>
 #include <tuple>
+#include <fcntl.h>
 #include <liburing.h>
 
 namespace beman::net::detail {
 
+struct uring_record {
+    native_handle_type handle;
+    bool               blocking{true};
+};
+
 // io_context implementation based on liburing
 struct uring_context final : context_base {
-    static constexpr unsigned     QUEUE_DEPTH = 128;
-    ::io_uring                    ring;
-    container<native_handle_type> sockets;
+    static constexpr unsigned  QUEUE_DEPTH = 128;
+    ::io_uring                 ring;
+    container<uring_record>    sockets;
     task*                         tasks       = nullptr;
     ::std::size_t                 submitting  = 0; // sqes not yet submitted
     ::std::size_t                 outstanding = 0; // cqes expected
@@ -33,7 +40,7 @@ struct uring_context final : context_base {
     }
     ~uring_context() override { ::io_uring_queue_exit(&ring); }
 
-    auto make_socket(int fd) -> socket_id override { return sockets.insert(fd); }
+    auto make_socket(int fd) -> socket_id override { return sockets.insert(uring_record{fd}); }
 
     auto make_socket(int d, int t, int p, ::std::error_code& error) -> socket_id override {
         int fd(::socket(d, t, p));
@@ -45,14 +52,14 @@ struct uring_context final : context_base {
     }
 
     auto release(socket_id id, ::std::error_code& error) -> void override {
-        const native_handle_type handle = sockets[id];
+        const native_handle_type handle = sockets[id].handle;
         sockets.erase(id);
         if (::close(handle) < 0) {
             error = ::std::error_code(errno, ::std::system_category());
         }
     }
 
-    auto native_handle(socket_id id) -> native_handle_type override { return sockets[id]; }
+    auto native_handle(socket_id id) -> native_handle_type override { return sockets[id].handle; }
 
     auto set_option(socket_id id, int level, int name, const void* data, ::socklen_t size, ::std::error_code& error)
         -> void override {
@@ -227,6 +234,38 @@ struct uring_context final : context_base {
     }
 
     auto receive(receive_operation* op) -> submit_result override {
+        auto& rec = this->sockets[op->id];
+        if (rec.blocking) {
+            if (-1 != ::fcntl(rec.handle, F_SETFL, O_NONBLOCK))
+                rec.blocking = false;
+        }
+
+        // Speculative read — skip the ring if data is already available
+        if (!rec.blocking) {
+            auto& msg   = ::std::get<0>(*op);
+            auto  flags = ::std::get<1>(*op);
+            ::ssize_t n;
+            do {
+                n = ::recvmsg(rec.handle, &msg, flags);
+            } while (n < 0 && errno == EINTR);
+
+            if (n >= 0) {
+                ::std::get<2>(*op) = static_cast<::std::size_t>(n);
+                op->complete();
+                return submit_result::ready;
+            }
+            if (errno == ECONNRESET || errno == EPIPE) {
+                ::std::get<2>(*op) = 0;
+                op->complete();
+                return submit_result::ready;
+            }
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                op->error(::std::error_code(errno, ::std::system_category()));
+                return submit_result::error;
+            }
+        }
+
+        // EWOULDBLOCK or blocking socket — submit through the ring
         op->work = [](context_base&, io_base* io) {
             auto res = *static_cast<int*>(io->extra.get());
             if (res == -ECANCELED) {
@@ -237,14 +276,13 @@ struct uring_context final : context_base {
                 return submit_result::error;
             }
             auto op = static_cast<receive_operation*>(io);
-            // set bytes received
             ::std::get<2>(*op) = res;
             io->complete();
             return submit_result::ready;
         };
 
         auto sqe   = get_sqe(op);
-        auto fd    = native_handle(op->id);
+        auto fd    = rec.handle;
         auto msg   = &::std::get<0>(*op);
         auto flags = ::std::get<1>(*op);
         ::io_uring_prep_recvmsg(sqe, fd, msg, flags);
