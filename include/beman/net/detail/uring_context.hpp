@@ -325,7 +325,12 @@ struct uring_context final : context_base {
     }
 
     auto resume_at(resume_at_operation* op) -> submit_result override {
-        auto at  = ::std::get<0>(*op);
+        auto at = ::std::get<0>(*op);
+        if (::std::chrono::system_clock::now() >= at) {
+            op->complete();
+            return submit_result::ready;
+        }
+
         op->work = [](context_base&, io_base* io) {
             auto res = *static_cast<int*>(io->extra.get());
             auto op  = static_cast<resume_at_operation*>(io);
